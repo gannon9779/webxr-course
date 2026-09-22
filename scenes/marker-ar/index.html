@@ -1,29 +1,192 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport"
-        content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-  <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.8/aframe/build/aframe-ar.js"></script>
-  <style>
-    body { margin: 0; overflow: hidden; }
-    .a-enter-vr { display: none; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>EM Wave AR</title>
+<script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.8/aframe/build/aframe-ar.js"></script>
+<style>
+  body { margin: 0; overflow: hidden; }
+  .a-enter-vr { display: none; }
+  #hint { position: fixed; bottom: 18px; left: 0; right: 0; text-align: center;
+          font: 15px system-ui, sans-serif; color: #fff;
+          text-shadow: 0 1px 4px #000; z-index: 10; pointer-events: none; }
+</style>
 </head>
 <body>
 
-  <a-scene embedded
-           arjs="sourceType: webcam; debugUIEnabled: false"
-           vr-mode-ui="enabled: false"
-           renderer="antialias: true; alpha: true">
+<script>
+// ── The wave itself ────────────────────────────────────────
+AFRAME.registerComponent('em-wave', {
+  schema: {
+    amplitude:  { default: 0.6 },
+    wavelength: { default: 2.0 },
+    frequency:  { default: 0.4 },
+    length:     { default: 6.0 },
+    samples:    { default: 48 },
+    thickness:  { default: 0.03 },
+    eColor:     { type: 'color', default: '#FF5252' },
+    bColor:     { type: 'color', default: '#448AFF' },
+    axisColor:  { type: 'color', default: '#DDDDDD' }
+  },
 
-    <a-marker preset="hiro">
-      <a-box position="0 0.5 0" material="color: red"></a-box>
-    </a-marker>
+  init: function () {
+    this.dummy = new THREE.Object3D();
+    this.markerEl = this.el.closest('a-marker');
+  },
 
-    <a-entity camera></a-entity>
-  </a-scene>
+  update: function (oldData) {
+    const d = this.data;
+    const structural = !oldData
+      || oldData.samples   !== d.samples
+      || oldData.thickness !== d.thickness
+      || oldData.length    !== d.length
+      || oldData.eColor    !== d.eColor
+      || oldData.bColor    !== d.bColor;
+    if (structural) { this.build(); }
+  },
+
+  build: function () {
+    const d = this.data;
+    this.destroy();
+
+    const group = new THREE.Group();
+    const boxGeo = new THREE.BoxGeometry(d.thickness, 1, d.thickness);
+
+    this.eMesh = new THREE.InstancedMesh(
+      boxGeo, new THREE.MeshBasicMaterial({ color: new THREE.Color(d.eColor) }), d.samples);
+    this.bMesh = new THREE.InstancedMesh(
+      boxGeo, new THREE.MeshBasicMaterial({ color: new THREE.Color(d.bColor) }), d.samples);
+    this.eMesh.frustumCulled = false;
+    this.bMesh.frustumCulled = false;
+    group.add(this.eMesh, this.bMesh);
+
+    this.ePos = new Float32Array(d.samples * 3);
+    this.bPos = new Float32Array(d.samples * 3);
+    this.eCurve = this.makeLine(this.ePos, d.eColor);
+    this.bCurve = this.makeLine(this.bPos, d.bColor);
+    group.add(this.eCurve, this.bCurve);
+
+    const axisGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-d.length / 2, 0, 0),
+      new THREE.Vector3( d.length / 2, 0, 0)
+    ]);
+    group.add(new THREE.Line(axisGeo,
+      new THREE.LineBasicMaterial({ color: new THREE.Color(d.axisColor) })));
+
+    this.el.setObject3D('emwave', group);
+  },
+
+  makeLine: function (arr, color) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+    return new THREE.Line(geo,
+      new THREE.LineBasicMaterial({ color: new THREE.Color(color) }));
+  },
+
+  tick: function (time) {
+    if (!this.eMesh) { return; }
+    if (this.markerEl && !this.markerEl.object3D.visible) { return; }
+
+    const d = this.data;
+    const t  = time / 1000;
+    const k  = (2 * Math.PI) / d.wavelength;   // wavenumber
+    const w  = 2 * Math.PI * d.frequency;      // angular frequency
+    const dx = d.length / (d.samples - 1);
+    const x0 = -d.length / 2;
+    const dummy = this.dummy;
+
+    for (let i = 0; i < d.samples; i++) {
+      const x = x0 + i * dx;
+
+      // ONE value drives both fields — they are in phase.
+      const a = d.amplitude * Math.sin(k * x - w * t);
+      const len = Math.abs(a) || 1e-4;
+
+      // E field — oscillates along Y
+      dummy.rotation.set(0, 0, 0);
+      dummy.position.set(x, a / 2, 0);
+      dummy.scale.set(1, len, 1);
+      dummy.updateMatrix();
+      this.eMesh.setMatrixAt(i, dummy.matrix);
+
+      // B field — oscillates along Z
+      dummy.rotation.set(Math.PI / 2, 0, 0);
+      dummy.position.set(x, 0, a / 2);
+      dummy.scale.set(1, len, 1);
+      dummy.updateMatrix();
+      this.bMesh.setMatrixAt(i, dummy.matrix);
+
+      this.ePos[i * 3] = x;  this.ePos[i * 3 + 1] = a;  this.ePos[i * 3 + 2] = 0;
+      this.bPos[i * 3] = x;  this.bPos[i * 3 + 1] = 0;  this.bPos[i * 3 + 2] = a;
+    }
+
+    this.eMesh.instanceMatrix.needsUpdate = true;
+    this.bMesh.instanceMatrix.needsUpdate = true;
+    this.eCurve.geometry.attributes.position.needsUpdate = true;
+    this.bCurve.geometry.attributes.position.needsUpdate = true;
+  },
+
+  destroy: function () {
+    if (this.el.getObject3D('emwave')) { this.el.removeObject3D('emwave'); }
+    this.eMesh = null;
+  },
+
+  remove: function () { this.destroy(); }
+});
+
+
+// ── Tap to change wavelength, holding c = λf constant ──────
+AFRAME.registerComponent('wave-controls', {
+  init: function () {
+    this.lambdas = [4, 2, 1.33, 1];
+    this.c = 0.8;                 // "speed of light" in scene units/sec
+    this.i = 1;
+    this.apply();
+    document.addEventListener('click', () => {
+      this.i = (this.i + 1) % this.lambdas.length;
+      this.apply();
+    });
+  },
+
+  apply: function () {
+    const lambda = this.lambdas[this.i];
+    const f = this.c / lambda;
+    const wave = document.querySelector('#wave');
+    wave.setAttribute('em-wave', 'wavelength', lambda);
+    wave.setAttribute('em-wave', 'frequency',  f);
+    document.querySelector('#readout')
+      .setAttribute('value', 'lambda ' + lambda.toFixed(2) + '   f ' + f.toFixed(2));
+  }
+});
+</script>
+
+<a-scene embedded
+         arjs="sourceType: webcam; debugUIEnabled: false"
+         vr-mode-ui="enabled: false"
+         renderer="antialias: true; alpha: true"
+         wave-controls>
+
+  <a-marker preset="hiro">
+    <a-entity scale="0.14 0.14 0.14" position="0 0.4 0">
+
+      <a-entity id="wave" em-wave></a-entity>
+
+      <a-text value="E" color="#FF5252" align="center"
+              position="-3.4 0.9 0" scale="1.4 1.4 1.4"></a-text>
+      <a-text value="B" color="#448AFF" align="center"
+              position="-3.4 0 0.9" scale="1.4 1.4 1.4" rotation="-90 0 0"></a-text>
+      <a-text id="readout" value="" color="#FFFFFF" align="center"
+              position="0 -1.4 0" scale="0.9 0.9 0.9"></a-text>
+
+    </a-entity>
+  </a-marker>
+
+  <a-entity camera></a-entity>
+</a-scene>
+
+<div id="hint">Tap anywhere to change wavelength</div>
 
 </body>
 </html>

@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Waves From A Phone</title>
+<script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.8/aframe/build/aframe-ar.js"></script>
+<style>
+  body { margin: 0; overflow: hidden; font-family: system-ui, -apple-system, sans-serif; }
+  .a-enter-vr { display: none; }
+
+  #panel {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    padding: 16px 18px 22px; text-align: center; color: #fff;
+    background: linear-gradient(to top, rgba(0,0,0,.8), rgba(0,0,0,0));
+    pointer-events: none;
+  }
+  #mode    { font-size: 27px; font-weight: 700; letter-spacing: .4px; }
+  #explain { font-size: 15px; opacity: .92; margin-top: 5px; line-height: 1.35; }
+  #tap     { font-size: 13px; opacity: .6; margin-top: 12px; }
+</style>
+</head>
+<body>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   radiating-waves
+   Expanding shells + rippling rays, flowing out of the phone
+   on an outgoing call and into it on an incoming one.
+   ═══════════════════════════════════════════════════════════ */
+AFRAME.registerComponent('radiating-waves', {
+  schema: {
+    mode:         { default: 'out' },        // 'out' | 'in'
+    shells:       { default: 5 },
+    maxRadius:    { default: 4.0 },
+    period:       { default: 2.4 },          // seconds for one shell to cross
+    rays:         { default: 6 },
+    rayAmplitude: { default: 0.16 },
+    rayWavelength:{ default: 0.65 },
+    raySamples:   { default: 70 },
+    outColor:     { type: 'color', default: '#FFB300' },
+    inColor:      { type: 'color', default: '#40C4FF' }
+  },
+
+  init: function () {
+    this.build();
+  },
+
+  update: function (oldData) {
+    if (oldData && oldData.mode !== this.data.mode) { this.recolour(); }
+  },
+
+  activeColor: function () {
+    return new THREE.Color(
+      this.data.mode === 'out' ? this.data.outColor : this.data.inColor);
+  },
+
+  build: function () {
+    const d = this.data;
+    const group = new THREE.Group();
+    const colour = this.activeColor();
+
+    /* ── expanding spherical shells ── */
+    this.shells = [];
+    const shellGeo = new THREE.SphereGeometry(1, 20, 12);
+    for (let i = 0; i < d.shells; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: colour.clone(),
+        wireframe: true,
+        transparent: true,
+        opacity: 0.3,
+        depthWrite: false
+      });
+      const mesh = new THREE.Mesh(shellGeo, mat);
+      mesh.frustumCulled = false;
+      group.add(mesh);
+      this.shells.push(mesh);
+    }
+
+    /* ── rays with a visible wave running along them ── */
+    this.rayLines = [];
+    this.rayDirs  = [];
+    for (let j = 0; j < d.rays; j++) {
+      const theta = (2 * Math.PI * j) / d.rays;
+      this.rayDirs.push(new THREE.Vector3(Math.cos(theta), 0, Math.sin(theta)));
+
+      const arr = new Float32Array(d.raySamples * 3);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+        color: colour.clone(), transparent: true, opacity: 0.9
+      }));
+      line.frustumCulled = false;
+      group.add(line);
+      this.rayLines.push({ line: line, arr: arr });
+    }
+
+    /* ── the source itself ── */
+    this.core = new THREE.Mesh(
+      new THREE.SphereGeometry(0.11, 14, 10),
+      new THREE.MeshBasicMaterial({ color: colour.clone(),
+                                    transparent: true, opacity: 0.95 }));
+    group.add(this.core);
+
+    this.el.setObject3D('waves', group);
+  },
+
+  recolour: function () {
+    const c = this.activeColor();
+    this.shells.forEach(s => s.material.color.copy(c));
+    this.rayLines.forEach(r => r.line.material.color.copy(c));
+    if (this.core) { this.core.material.color.copy(c); }
+  },
+
+  tick: function (time) {
+    if (!this.shells) { return; }
+
+    const d  = this.data;
+    const t  = time / 1000;
+    const out = (d.mode === 'out');
+
+    /* ── shells ── */
+    for (let i = 0; i < this.shells.length; i++) {
+      let phase = ((t / d.period) + i / this.shells.length) % 1;
+
+      const radius  = (out ? phase : 1 - phase) * d.maxRadius;
+      const opacity = (out ? (1 - phase) : phase) * 0.34;
+
+      const s = this.shells[i];
+      s.scale.setScalar(Math.max(radius, 0.001));
+      s.material.opacity = opacity;
+    }
+
+    /* ── rays ── */
+    const k = (2 * Math.PI) / d.rayWavelength;
+    const v = d.maxRadius / d.period;          // travel speed
+    const w = k * v;
+    const M = d.raySamples;
+
+    for (let j = 0; j < this.rayLines.length; j++) {
+      const dir = this.rayDirs[j];
+      const arr = this.rayLines[j].arr;
+
+      for (let m = 0; m < M; m++) {
+        const f = m / (M - 1);
+        const r = f * d.maxRadius;
+
+        // fade in the direction of travel
+        const env = out ? (1 - f) : f;
+
+        const y = d.rayAmplitude * env *
+                  Math.sin(k * r + (out ? -w * t : w * t));
+
+        arr[m * 3]     = dir.x * r;
+        arr[m * 3 + 1] = y;
+        arr[m * 3 + 2] = dir.z * r;
+      }
+      this.rayLines[j].line.geometry.attributes.position.needsUpdate = true;
+    }
+
+    /* ── source pulse ── */
+    const pulse = 1 + 0.25 * Math.sin((t / d.period) * Math.PI * 2);
+    this.core.scale.setScalar(pulse);
+  },
+
+  remove: function () { this.el.removeObject3D('waves'); }
+});
+
+
+/* ── tap to switch between an outgoing and an incoming call ── */
+AFRAME.registerComponent('call-mode', {
+  init: function () {
+    this.modes = [
+      { id: 'out',
+        title: 'CALLING OUT',
+        text: 'Your voice leaves the phone as radio waves, spreading out in every direction to reach a tower.' },
+      { id: 'in',
+        title: 'INCOMING CALL',
+        text: 'Waves from the tower arrive from every direction and the phone turns them back into a voice.' }
+    ];
+    this.i = 0;
+    this.apply();
+    document.addEventListener('click', () => {
+      this.i = (this.i + 1) % this.modes.length;
+      this.apply();
+    });
+  },
+
+  apply: function () {
+    const m = this.modes[this.i];
+    document.querySelector('#waves').setAttribute('radiating-waves', 'mode', m.id);
+    document.querySelector('#mode').textContent    = m.title;
+    document.querySelector('#explain').textContent = m.text;
+    document.querySelector('#mode').style.color = (m.id === 'out') ? '#FFB300' : '#40C4FF';
+
+    const label = document.querySelector('#modeLabel');
+    if (label) {
+      label.setAttribute('value', m.title);
+      label.setAttribute('color', (m.id === 'out') ? '#FFB300' : '#40C4FF');
+    }
+  }
+});
+</script>
+
+
+<a-scene embedded
+         arjs="sourceType: webcam; debugUIEnabled: false"
+         vr-mode-ui="enabled: false"
+         renderer="antialias: true; alpha: true"
+         call-mode>
+
+  <a-marker preset="hiro">
+
+    <a-entity id="waves" radiating-waves position="0 0.1 0"></a-entity>
+
+    <a-text id="modeLabel" value="CALLING OUT" color="#FFB300" align="center"
+            position="0 2.3 0" scale="1.1 1.1 1.1"></a-text>
+
+  </a-marker>
+
+  <a-entity camera></a-entity>
+</a-scene>
+
+
+<div id="panel">
+  <div id="mode">CALLING OUT</div>
+  <div id="explain">Your voice leaves the phone as radio waves, spreading out in every direction to reach a tower.</div>
+  <div id="tap">Tap to switch between an outgoing and an incoming call</div>
+</div>
+
+</body>
+</html>

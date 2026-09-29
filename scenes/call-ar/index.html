@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>A Call, In The Room</title>
+<script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.8/aframe/build/aframe-ar.js"></script>
+<style>
+  body { margin: 0; overflow: hidden; font-family: system-ui, -apple-system, sans-serif; }
+  .a-enter-vr { display: none; }
+
+  #panel {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    padding: 14px 18px 20px; text-align: center; color: #fff;
+    background: linear-gradient(to top, rgba(0,0,0,.8), rgba(0,0,0,0));
+    pointer-events: none;
+  }
+  #status { font-size: 24px; font-weight: 700; letter-spacing: .3px; }
+  #detail { font-size: 15px; opacity: .9; margin-top: 4px; }
+
+  #barWrap { width: 210px; height: 8px; margin: 10px auto 0;
+             background: rgba(255,255,255,.22); border-radius: 4px; overflow: hidden; }
+  #bar     { height: 100%; width: 0%; background: #4CAF50; transition: width .15s, background .25s; }
+
+  #legend { font-size: 13px; margin-top: 9px; opacity: .85; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+        margin: 0 5px 0 14px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   call-link
+   Watches two markers. While both are in view, streams data
+   packets between them and weakens the connection with distance.
+   ═══════════════════════════════════════════════════════════ */
+AFRAME.registerComponent('call-link', {
+  schema: {
+    phone:    { type: 'selector' },
+    tower:    { type: 'selector' },
+    packets:  { default: 26 },
+    size:     { default: 0.09 },
+    speed:    { default: 0.55 },   // trips per second at full strength
+    lift:     { default: 0.45 },   // how high the stream floats
+    nearDist: { default: 1.8 },    // closer than this = full bars
+    farDist:  { default: 8.0 },    // further than this = dropped
+    outColor: { type: 'color', default: '#FFB300' },  // your voice going out
+    inColor:  { type: 'color', default: '#40C4FF' },  // their voice coming back
+    lostColor:{ type: 'color', default: '#FF3D00' }
+  },
+
+  init: function () {
+    const d = this.data;
+
+    this.pA = new THREE.Vector3();
+    this.pB = new THREE.Vector3();
+    this.pos = new THREE.Vector3();
+    this.dummy = new THREE.Object3D();
+    this.col = new THREE.Color();
+
+    this.half = Math.floor(d.packets / 2);
+
+    // each packet: where along the path, and where (if anywhere) it dies
+    this.progress = new Float32Array(d.packets);
+    this.dieAt    = new Float32Array(d.packets);
+    for (let i = 0; i < d.packets; i++) {
+      this.progress[i] = Math.random();
+      this.dieAt[i] = 2;                 // 2 = survives the whole trip
+    }
+
+    const geo = new THREE.SphereGeometry(d.size, 8, 6);
+    const mat = new THREE.MeshBasicMaterial();
+    this.mesh = new THREE.InstancedMesh(geo, mat, d.packets);
+    this.mesh.frustumCulled = false;
+    this.el.setObject3D('packets', this.mesh);
+
+    this.strength = 0;
+    this.connected = false;
+    this.lastBars = -1;
+
+    this.ui = {
+      status: document.querySelector('#status'),
+      detail: document.querySelector('#detail'),
+      bar:    document.querySelector('#bar')
+    };
+  },
+
+  tick: function (time, delta) {
+    const d = this.data;
+    const dt = Math.min(delta / 1000, 0.05);
+
+    const phoneSeen = d.phone && d.phone.object3D.visible;
+    const towerSeen = d.tower && d.tower.object3D.visible;
+
+    /* ── not both in view: nothing to draw ── */
+    if (!phoneSeen || !towerSeen) {
+      this.mesh.visible = false;
+      this.setUI(
+        phoneSeen || towerSeen ? 'LOOKING FOR THE OTHER END' : 'POINT AT BOTH MARKERS',
+        'Keep the phone and the tower in view at the same time.',
+        0, '#757575');
+      this.setBars(0);
+      return;
+    }
+
+    this.mesh.visible = true;
+
+    d.phone.object3D.getWorldPosition(this.pA);
+    d.tower.object3D.getWorldPosition(this.pB);
+    this.pA.y += d.lift;
+    this.pB.y += d.lift;
+
+    /* ── how good is the link? ── */
+    const dist = this.pA.distanceTo(this.pB);
+    let s = (d.farDist - dist) / (d.farDist - d.nearDist);
+    s = Math.max(0, Math.min(1, s));
+    this.strength = s;
+
+    const lossChance = (1 - s) * 0.85;
+    const step = d.speed * dt * (0.35 + 0.65 * s);   // weak link = sluggish
+
+    for (let i = 0; i < d.packets; i++) {
+      this.progress[i] += step;
+
+      if (this.progress[i] >= 1) {
+        this.progress[i] -= 1;
+        // decide this trip's fate as it sets off
+        this.dieAt[i] = (Math.random() < lossChance)
+          ? 0.25 + Math.random() * 0.55
+          : 2;
+      }
+
+      const p = this.progress[i];
+      const outbound = i < this.half;
+      const doomed = this.dieAt[i] < 2;
+
+      if (p > this.dieAt[i]) {          // this one didn't make it
+        this.dummy.position.set(0, -9999, 0);
+        this.dummy.scale.set(0.0001, 0.0001, 0.0001);
+      } else {
+        const f = outbound ? p : 1 - p;
+        this.pos.lerpVectors(this.pA, this.pB, f);
+
+        // gentle arc so the stream reads as a path, not a line of dots
+        this.pos.y += Math.sin(Math.PI * f) * 0.35;
+
+        this.dummy.position.copy(this.pos);
+        const fade = doomed ? 1 - (p / this.dieAt[i]) * 0.45 : 1;
+        this.dummy.scale.setScalar(fade);
+      }
+
+      this.dummy.rotation.set(0, 0, 0);
+      this.dummy.updateMatrix();
+      this.mesh.setMatrixAt(i, this.dummy.matrix);
+
+      this.col.set(doomed ? d.lostColor : (outbound ? d.outColor : d.inColor));
+      this.mesh.setColorAt(i, this.col);
+    }
+
+    this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.mesh.instanceColor) { this.mesh.instanceColor.needsUpdate = true; }
+
+    /* ── report ── */
+    let title, note, colour;
+    if (s > 0.62)      { title = 'CONNECTED';       note = 'Clear call. Every packet arrives.';        colour = '#4CAF50'; }
+    else if (s > 0.28) { title = 'WEAK SIGNAL';     note = 'Further apart now — packets start to go missing.'; colour = '#FFC107'; }
+    else if (s > 0.04) { title = 'BARELY HOLDING';  note = 'Most of the voice is being lost on the way.'; colour = '#FF9800'; }
+    else               { title = 'CALL DROPPED';    note = 'Too far from the tower. Nothing gets through.'; colour = '#F44336'; }
+
+    this.setUI(title, note, s, colour);
+    this.setBars(Math.ceil(s * 4));
+  },
+
+  setUI: function (title, note, s, colour) {
+    if (!this.ui.status) { return; }
+    if (this.ui.status.textContent !== title) {
+      this.ui.status.textContent = title;
+      this.ui.status.style.color = colour;
+    }
+    if (this.ui.detail.textContent !== note) { this.ui.detail.textContent = note; }
+    this.ui.bar.style.width = Math.round(s * 100) + '%';
+    this.ui.bar.style.background = colour;
+  },
+
+  setBars: function (n) {
+    if (n === this.lastBars) { return; }
+    this.lastBars = n;
+    for (let b = 1; b <= 4; b++) {
+      const el = document.querySelector('#bar' + b);
+      if (el) { el.setAttribute('visible', b <= n); }
+    }
+  },
+
+  remove: function () { this.el.removeObject3D('packets'); }
+});
+</script>
+
+
+<a-scene embedded
+         arjs="sourceType: webcam; debugUIEnabled: false"
+         vr-mode-ui="enabled: false"
+         renderer="antialias: true; alpha: true">
+
+  <!-- ══ YOUR PHONE ══ -->
+  <a-marker preset="hiro" id="phoneMarker">
+    <a-entity position="0 0 0">
+      <a-box position="0 0.28 0" width="0.34" height="0.6" depth="0.06"
+             color="#263238"></a-box>
+      <a-box position="0 0.3 0.035" width="0.27" height="0.48" depth="0.01"
+             color="#4FC3F7"></a-box>
+
+      <!-- signal bars above the phone -->
+      <a-box id="bar1" position="-0.18 0.78 0" width="0.05" height="0.08" depth="0.05" color="#4CAF50"></a-box>
+      <a-box id="bar2" position="-0.08 0.82 0" width="0.05" height="0.16" depth="0.05" color="#4CAF50"></a-box>
+      <a-box id="bar3" position=" 0.02 0.86 0" width="0.05" height="0.24" depth="0.05" color="#4CAF50"></a-box>
+      <a-box id="bar4" position=" 0.12 0.90 0" width="0.05" height="0.32" depth="0.05" color="#4CAF50"></a-box>
+
+      <a-text value="YOUR PHONE" color="#FFFFFF" align="center"
+              position="0 -0.35 0" scale="0.6 0.6 0.6"></a-text>
+    </a-entity>
+  </a-marker>
+
+  <!-- ══ CELL TOWER ══ -->
+  <a-marker preset="kanji" id="towerMarker">
+    <a-entity position="0 0 0">
+      <a-cylinder position="0 0.7 0" radius="0.045" height="1.4" color="#9E9E9E"></a-cylinder>
+      <a-box position="0 1.42 0" width="0.5" height="0.04" depth="0.04" color="#BDBDBD"></a-box>
+      <a-box position="0 1.30 0" width="0.36" height="0.04" depth="0.04" color="#BDBDBD"></a-box>
+      <a-sphere position="0 1.55 0" radius="0.07" color="#FF5252"></a-sphere>
+
+      <a-text value="CELL TOWER" color="#FFFFFF" align="center"
+              position="0 -0.35 0" scale="0.6 0.6 0.6"></a-text>
+    </a-entity>
+  </a-marker>
+
+  <!-- the link lives in world space, not on either marker -->
+  <a-entity id="link"
+            call-link="phone: #phoneMarker; tower: #towerMarker"></a-entity>
+
+  <a-entity camera></a-entity>
+</a-scene>
+
+
+<div id="panel">
+  <div id="status">POINT AT BOTH MARKERS</div>
+  <div id="detail">Keep the phone and the tower in view at the same time.</div>
+  <div id="barWrap"><div id="bar"></div></div>
+  <div id="legend">
+    <span class="sw" style="background:#FFB300"></span>your voice out
+    <span class="sw" style="background:#40C4FF"></span>their voice back
+    <span class="sw" style="background:#FF3D00"></span>lost
+  </div>
+</div>
+
+</body>
+</html>

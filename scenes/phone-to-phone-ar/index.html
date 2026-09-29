@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Phone To Phone</title>
+<script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.8/aframe/build/aframe-ar.js"></script>
+<style>
+  body { margin: 0; overflow: hidden; font-family: system-ui, -apple-system, sans-serif; }
+  .a-enter-vr { display: none; }
+
+  #panel {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    padding: 16px 18px 22px; text-align: center; color: #fff;
+    background: linear-gradient(to top, rgba(0,0,0,.82), rgba(0,0,0,0));
+    pointer-events: none;
+  }
+  #title   { font-size: 26px; font-weight: 700; letter-spacing: .3px; }
+  #explain { font-size: 15px; opacity: .92; margin-top: 5px; line-height: 1.35; }
+  #tap     { font-size: 13px; opacity: .6; margin-top: 12px; }
+</style>
+</head>
+<body>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   wave-beam
+   Waves travelling from one marked phone to the other.
+   Tap flips which phone is talking.
+   ═══════════════════════════════════════════════════════════ */
+AFRAME.registerComponent('wave-beam', {
+  schema: {
+    phoneA:    { type: 'selector' },
+    phoneB:    { type: 'selector' },
+    direction: { default: 'AtoB' },          // 'AtoB' | 'BtoA'
+    rings:     { default: 7 },
+    ringRadius:{ default: 0.42 },
+    period:    { default: 2.0 },             // seconds for a ring to cross
+    samples:   { default: 90 },
+    amplitude: { default: 0.24 },
+    wavelength:{ default: 0.8 },
+    lift:      { default: 0.55 },
+    colorAB:   { type: 'color', default: '#FFB300' },
+    colorBA:   { type: 'color', default: '#40C4FF' }
+  },
+
+  init: function () {
+    const d = this.data;
+
+    this.pFrom = new THREE.Vector3();
+    this.pTo   = new THREE.Vector3();
+    this.dir   = new THREE.Vector3();
+    this.perp  = new THREE.Vector3();
+    this.side  = new THREE.Vector3();
+    this.tmp   = new THREE.Vector3();
+    this.zAxis = new THREE.Vector3(0, 0, 1);
+    this.quat  = new THREE.Quaternion();
+
+    const group = new THREE.Group();
+
+    /* travelling ring wavefronts */
+    this.rings = [];
+    const ringGeo = new THREE.TorusGeometry(1, 0.055, 8, 30);
+    for (let i = 0; i < d.rings; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        transparent: true, opacity: 0.6, depthWrite: false
+      });
+      const mesh = new THREE.Mesh(ringGeo, mat);
+      mesh.frustumCulled = false;
+      group.add(mesh);
+      this.rings.push(mesh);
+    }
+
+    /* the wave itself, running along the path */
+    this.waveArr = new Float32Array(d.samples * 3);
+    const waveGeo = new THREE.BufferGeometry();
+    waveGeo.setAttribute('position', new THREE.BufferAttribute(this.waveArr, 3));
+    this.wave = new THREE.Line(waveGeo, new THREE.LineBasicMaterial({
+      transparent: true, opacity: 0.95
+    }));
+    this.wave.frustumCulled = false;
+    group.add(this.wave);
+
+    /* a glow at each end */
+    const ballGeo = new THREE.SphereGeometry(0.13, 14, 10);
+    this.fromBall = new THREE.Mesh(ballGeo,
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.95 }));
+    this.toBall = new THREE.Mesh(ballGeo,
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.5 }));
+    group.add(this.fromBall, this.toBall);
+
+    this.el.setObject3D('beam', group);
+
+    this.ui = {
+      title:   document.querySelector('#title'),
+      explain: document.querySelector('#explain')
+    };
+  },
+
+  activeColor: function () {
+    return new THREE.Color(
+      this.data.direction === 'AtoB' ? this.data.colorAB : this.data.colorBA);
+  },
+
+  tick: function (time) {
+    const d = this.data;
+    const t = time / 1000;
+
+    const aSeen = d.phoneA && d.phoneA.object3D.visible;
+    const bSeen = d.phoneB && d.phoneB.object3D.visible;
+    const root = this.el.getObject3D('beam');
+
+    if (!aSeen || !bSeen) {
+      root.visible = false;
+      this.setUI('POINT AT BOTH PHONES',
+                 'Keep both markers in view at the same time.', '#9E9E9E');
+      this.setBadges(null);
+      return;
+    }
+    root.visible = true;
+
+    const AtoB = (d.direction === 'AtoB');
+    (AtoB ? d.phoneA : d.phoneB).object3D.getWorldPosition(this.pFrom);
+    (AtoB ? d.phoneB : d.phoneA).object3D.getWorldPosition(this.pTo);
+    this.pFrom.y += d.lift;
+    this.pTo.y   += d.lift;
+
+    const colour = this.activeColor();
+
+    /* ── build a frame along the path ── */
+    this.dir.subVectors(this.pTo, this.pFrom);
+    const len = this.dir.length();
+    if (len < 0.0001) { return; }
+    this.dir.divideScalar(len);
+
+    this.tmp.set(0, 1, 0);
+    if (Math.abs(this.dir.y) > 0.92) { this.tmp.set(1, 0, 0); }
+    this.side.crossVectors(this.dir, this.tmp).normalize();
+    this.perp.crossVectors(this.side, this.dir).normalize();
+
+    /* ── the wave ── */
+    const k = (2 * Math.PI) / d.wavelength;
+    const v = len / d.period;
+    const w = k * v;
+    const M = d.samples;
+
+    for (let m = 0; m < M; m++) {
+      const f = m / (M - 1);
+      const r = f * len;
+
+      // taper at both ends so it doesn't stab through the phones
+      const env = Math.sin(Math.PI * f);
+      const off = d.amplitude * env * Math.sin(k * r - w * t);
+
+      this.tmp.copy(this.pFrom).addScaledVector(this.dir, r)
+                               .addScaledVector(this.perp, off);
+      this.waveArr[m * 3]     = this.tmp.x;
+      this.waveArr[m * 3 + 1] = this.tmp.y;
+      this.waveArr[m * 3 + 2] = this.tmp.z;
+    }
+    this.wave.geometry.attributes.position.needsUpdate = true;
+    this.wave.material.color.copy(colour);
+
+    /* ── ring wavefronts sliding down the path ── */
+    this.quat.setFromUnitVectors(this.zAxis, this.dir);
+
+    for (let i = 0; i < this.rings.length; i++) {
+      const phase = ((t / d.period) + i / this.rings.length) % 1;
+      const ring = this.rings[i];
+
+      this.tmp.copy(this.pFrom).addScaledVector(this.dir, phase * len);
+      ring.position.copy(this.tmp);
+      ring.quaternion.copy(this.quat);
+
+      // grow a little as they travel, fade in and out at the ends
+      const grow = 0.6 + 0.8 * phase;
+      ring.scale.setScalar(d.ringRadius * grow);
+      ring.material.color.copy(colour);
+      ring.material.opacity = 0.62 * Math.sin(Math.PI * phase);
+    }
+
+    /* ── end glows ── */
+    this.fromBall.position.copy(this.pFrom);
+    this.toBall.position.copy(this.pTo);
+    this.fromBall.material.color.copy(colour);
+    this.toBall.material.color.copy(colour);
+
+    const pulse = 1 + 0.3 * Math.sin((t / d.period) * Math.PI * 2);
+    this.fromBall.scale.setScalar(pulse);
+    this.toBall.scale.setScalar(2 - pulse);
+
+    /* ── words ── */
+    if (AtoB) {
+      this.setUI('PHONE A IS TALKING',
+                 'A turns a voice into radio waves. They cross the gap and B turns them back into sound.',
+                 d.colorAB);
+    } else {
+      this.setUI('PHONE B IS TALKING',
+                 'Now it runs the other way. Same waves, opposite direction.',
+                 d.colorBA);
+    }
+    this.setBadges(AtoB);
+  },
+
+  setUI: function (title, note, colour) {
+    if (!this.ui.title) { return; }
+    if (this.ui.title.textContent !== title) {
+      this.ui.title.textContent = title;
+      this.ui.title.style.color = colour;
+    }
+    if (this.ui.explain.textContent !== note) { this.ui.explain.textContent = note; }
+  },
+
+  setBadges: function (AtoB) {
+    const a = document.querySelector('#badgeA');
+    const b = document.querySelector('#badgeB');
+    if (!a || !b) { return; }
+
+    if (AtoB === null) {
+      a.setAttribute('value', 'PHONE A');  a.setAttribute('color', '#FFFFFF');
+      b.setAttribute('value', 'PHONE B');  b.setAttribute('color', '#FFFFFF');
+      return;
+    }
+    a.setAttribute('value', AtoB ? 'A - SENDING'   : 'A - LISTENING');
+    b.setAttribute('value', AtoB ? 'B - LISTENING' : 'B - SENDING');
+    a.setAttribute('color', AtoB ? this.data.colorAB : '#BDBDBD');
+    b.setAttribute('color', AtoB ? '#BDBDBD' : this.data.colorBA);
+  },
+
+  remove: function () { this.el.removeObject3D('beam'); }
+});
+
+
+/* ── tap to flip who is talking ── */
+AFRAME.registerComponent('flip-direction', {
+  init: function () {
+    this.atob = true;
+    document.addEventListener('click', () => {
+      this.atob = !this.atob;
+      document.querySelector('#beam')
+        .setAttribute('wave-beam', 'direction', this.atob ? 'AtoB' : 'BtoA');
+    });
+  }
+});
+</script>
+
+
+<a-scene embedded
+         arjs="sourceType: webcam; debugUIEnabled: false"
+         vr-mode-ui="enabled: false"
+         renderer="antialias: true; alpha: true"
+         flip-direction>
+
+  <!-- PHONE A -->
+  <a-marker preset="hiro" id="phoneA">
+    <a-text id="badgeA" value="PHONE A" color="#FFFFFF" align="center"
+            position="0 1.5 0" scale="0.9 0.9 0.9"></a-text>
+  </a-marker>
+
+  <!-- PHONE B -->
+  <a-marker preset="kanji" id="phoneB">
+    <a-text id="badgeB" value="PHONE B" color="#FFFFFF" align="center"
+            position="0 1.5 0" scale="0.9 0.9 0.9"></a-text>
+  </a-marker>
+
+  <!-- the beam lives in world space, not on either marker -->
+  <a-entity id="beam" wave-beam="phoneA: #phoneA; phoneB: #phoneB"></a-entity>
+
+  <a-entity camera></a-entity>
+</a-scene>
+
+
+<div id="panel">
+  <div id="title">POINT AT BOTH PHONES</div>
+  <div id="explain">Keep both markers in view at the same time.</div>
+  <div id="tap">Tap to switch which phone is talking</div>
+</div>
+
+</body>
+</html>

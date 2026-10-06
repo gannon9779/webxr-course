@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Real Phone Waves</title>
+<script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.8/aframe/build/aframe-ar.js"></script>
+<style>
+  body { margin: 0; overflow: hidden; font-family: system-ui, -apple-system, sans-serif; }
+  .a-enter-vr { display: none; }
+
+  #panel {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    padding: 14px 16px 20px; text-align: center; color: #fff;
+    background: linear-gradient(to top, rgba(0,0,0,.85), rgba(0,0,0,0));
+    pointer-events: none;
+  }
+  #band   { font-size: 15px; letter-spacing: 1.2px; opacity: .8; text-transform: uppercase; }
+  #lambda { font-size: 36px; font-weight: 700; margin-top: 2px; line-height: 1.1; }
+  #lamSub { font-size: 13px; opacity: .72; margin-top: 2px; }
+  #stats  { font-size: 13px; opacity: .88; margin-top: 10px; line-height: 1.5; }
+  #tap    { font-size: 12px; opacity: .55; margin-top: 10px; }
+
+  #modeBtn {
+    position: fixed; top: 14px; right: 14px; z-index: 11;
+    padding: 9px 15px; border-radius: 999px; border: 1px solid rgba(255,255,255,.4);
+    background: rgba(0,0,0,.55); color: #fff; font-size: 14px; font-weight: 600;
+    pointer-events: auto; -webkit-tap-highlight-color: transparent;
+  }
+  #warn {
+    position: fixed; top: 14px; left: 14px; z-index: 11; max-width: 46%;
+    font-size: 11px; color: #FFD54F; opacity: .9; line-height: 1.35;
+    text-shadow: 0 1px 3px #000; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   real-waves
+   Everything here is computed from real numbers:
+     lambda = c / f
+     half-wave dipole pattern  ~ sin^2(theta)
+     field amplitude ~ 1/r, power density ~ 1/r^2
+     effective aperture = lambda^2 * G / (4*pi)
+   The only free choice is markerSizeCm, which anchors
+   scene units to real centimetres.   >>> SET TO 8.5 <<<
+   ═══════════════════════════════════════════════════════════ */
+
+const C_LIGHT = 299792458;        // m/s
+const G_DIPOLE = 1.64;            // half-wave dipole gain, linear (2.15 dBi)
+
+const BANDS = [
+  { name: '700 MHz  ·  low-band 5G',   mhz: 700 },
+  { name: '1.9 GHz  ·  LTE / PCS',     mhz: 1900 },
+  { name: '2.4 GHz  ·  Wi-Fi',         mhz: 2400 },
+  { name: '3.5 GHz  ·  5G mid-band',   mhz: 3500 },
+  { name: '28 GHz  ·  5G mmWave',      mhz: 28000 }
+];
+
+AFRAME.registerComponent('real-waves', {
+  schema: {
+    markerSizeCm: { default: 8.5 },     // ← measured printed marker
+    bandIndex:    { default: 1 },
+    mode:         { default: 'tx' },    // 'tx' | 'rx'
+    txPower:      { default: 0.25 },    // watts
+    towerDist:    { default: 500 },     // metres, for the rx readout
+    reach:        { default: 0.6 },     // metres of space to draw around the phone
+    raySamples:   { default: 500 },
+    txColor:      { type: 'color', default: '#FFB300' },
+    rxColor:      { type: 'color', default: '#40C4FF' }
+  },
+
+  /* ── unit helpers ───────────────────────────────────────── */
+  unitsPerMetre: function () { return 100 / this.data.markerSizeCm; },
+  lambdaMetres:  function () { return C_LIGHT / (BANDS[this.data.bandIndex].mhz * 1e6); },
+
+  init: function () {
+    this.tmp   = new THREE.Vector3();
+    this.quat  = new THREE.Quaternion();
+    this.zAxis = new THREE.Vector3(0, 0, 1);
+    this.inDir = new THREE.Vector3(-1, 0, 0).normalize();   // rx arrives from +X
+
+    const group = new THREE.Group();
+
+    /* ── TX: the dipole pattern, as an expanding lobe ── */
+    this.lobes = [];
+    const lobeGeo = this.makeLobeGeometry(26, 40);
+    for (let i = 0; i < 3; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        wireframe: true, transparent: true, opacity: 0.25, depthWrite: false
+      });
+      const m = new THREE.Mesh(lobeGeo, mat);
+      m.frustumCulled = false;
+      group.add(m);
+      this.lobes.push(m);
+    }
+
+    /* ── TX: true-wavelength rays in the plane of maximum gain ── */
+    this.rays = [];
+    for (let j = 0; j < 4; j++) {
+      const theta = (Math.PI / 2) * j;
+      const arr = new Float32Array(this.data.raySamples * 3);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+        transparent: true, opacity: 0.95
+      }));
+      line.frustumCulled = false;
+      group.add(line);
+      this.rays.push({
+        line: line, arr: arr,
+        dir: new THREE.Vector3(Math.cos(theta), 0, Math.sin(theta))
+      });
+    }
+
+    /* ── RX: plane wavefronts sweeping through the room ── */
+    this.fronts = [];
+    const frontGeo = new THREE.PlaneGeometry(1, 1, 7, 7);
+    for (let i = 0; i < 40; i++) {
+      const mat = new THREE.MeshBasicMaterial({
+        wireframe: true, transparent: true, opacity: 0.0, depthWrite: false
+      });
+      const m = new THREE.Mesh(frontGeo, mat);
+      m.frustumCulled = false;
+      m.visible = false;
+      group.add(m);
+      this.fronts.push(m);
+    }
+
+    /* ── RX: the sliver of wavefront the phone actually captures ── */
+    this.aperture = new THREE.Mesh(
+      new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.85,
+                                    side: THREE.DoubleSide, depthWrite: false })
+    );
+    this.aperture.frustumCulled = false;
+    group.add(this.aperture);
+
+    /* ── the antenna ── */
+    this.antenna = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.02, 0.02, 1, 8),
+      new THREE.MeshBasicMaterial({ color: 0xffffff })
+    );
+    group.add(this.antenna);
+
+    this.el.setObject3D('rw', group);
+
+    this.ui = {
+      band:   document.querySelector('#band'),
+      lambda: document.querySelector('#lambda'),
+      lamSub: document.querySelector('#lamSub'),
+      stats:  document.querySelector('#stats')
+    };
+    this.lastKey = '';
+  },
+
+  /* r(theta) = sin^2(theta), revolved — the classic dipole doughnut */
+  makeLobeGeometry: function (tSteps, pSteps) {
+    const pos = [];
+    const idx = [];
+    for (let i = 0; i <= tSteps; i++) {
+      const th = (i / tSteps) * Math.PI;
+      const s = Math.sin(th);
+      const r = s * s;
+      for (let j = 0; j <= pSteps; j++) {
+        const ph = (j / pSteps) * Math.PI * 2;
+        pos.push(r * s * Math.cos(ph), r * Math.cos(th), r * s * Math.sin(ph));
+      }
+    }
+    const row = pSteps + 1;
+    for (let i = 0; i < tSteps; i++) {
+      for (let j = 0; j < pSteps; j++) {
+        const a = i * row + j, b = a + 1, c = a + row, d = c + 1;
+        idx.push(a, b, d, a, d, c);
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setIndex(idx);
+    return g;
+  },
+
+  tick: function (time) {
+    const d = this.data;
+    const t = time / 1000;
+
+    const upm      = this.unitsPerMetre();
+    const lamM     = this.lambdaMetres();
+    const lamU     = lamM * upm;
+    const reachU   = d.reach * upm;
+    const tx       = (d.mode === 'tx');
+    const colour   = new THREE.Color(tx ? d.txColor : d.rxColor);
+
+    /* antenna: a half-wavelength rod, drawn at true size */
+    this.antenna.scale.set(1, Math.max(lamU * 0.5, 0.05), 1);
+    this.antenna.position.set(0, lamU * 0.25, 0);
+    this.antenna.material.color.copy(colour);
+
+    /* ─────────────── TRANSMIT ─────────────── */
+    this.lobes.forEach(l => l.visible = tx);
+    this.rays.forEach(r => r.line.visible = tx);
+
+    if (tx) {
+      for (let i = 0; i < this.lobes.length; i++) {
+        const phase = ((t / 2.2) + i / this.lobes.length) % 1;
+        const rU = phase * reachU;
+        const l = this.lobes[i];
+        l.scale.setScalar(Math.max(rU, 0.001));
+        l.material.color.copy(colour);
+        l.material.opacity = 0.3 * (1 - phase) * (1 - phase);
+      }
+
+      const k = (2 * Math.PI) / lamU;
+      const w = k * (reachU / 2.2);
+      const M = d.raySamples;
+      const minU = 0.25;
+
+      for (let j = 0; j < this.rays.length; j++) {
+        const ray = this.rays[j];
+        for (let m = 0; m < M; m++) {
+          const f = m / (M - 1);
+          const rU = minU + f * (reachU - minU);
+
+          // field amplitude really does fall as 1/r
+          const amp = (lamU * 0.18) * (minU / rU);
+          const off = amp * Math.sin(k * rU - w * t);
+
+          this.tmp.copy(ray.dir).multiplyScalar(rU);
+          ray.arr[m * 3]     = this.tmp.x;
+          ray.arr[m * 3 + 1] = off;
+          ray.arr[m * 3 + 2] = this.tmp.z;
+        }
+        ray.line.geometry.attributes.position.needsUpdate = true;
+        ray.line.material.color.copy(colour);
+      }
+    }
+
+    /* ─────────────── RECEIVE ─────────────── */
+    this.aperture.visible = !tx;
+
+    if (!tx) {
+      const span = reachU * 2.2;
+      const count = Math.max(6, Math.min(40, Math.round(span / lamU)));
+      this.quat.setFromUnitVectors(this.zAxis, this.inDir);
+      const travel = (t * (reachU / 2.2)) % lamU;
+
+      for (let i = 0; i < this.fronts.length; i++) {
+        const fr = this.fronts[i];
+        if (i >= count) { fr.visible = false; continue; }
+        fr.visible = true;
+
+        const along = (i * lamU) + travel - span * 0.5;
+        this.tmp.copy(this.inDir).multiplyScalar(-along);
+        fr.position.copy(this.tmp);
+        fr.quaternion.copy(this.quat);
+        fr.scale.set(reachU * 1.5, reachU * 1.5, 1);
+        fr.material.color.copy(colour);
+        fr.material.opacity = 0.16;
+      }
+
+      const aEff = (lamM * lamM * G_DIPOLE) / (4 * Math.PI);   // m^2
+      const sideU = Math.sqrt(aEff) * upm;
+      this.aperture.scale.set(Math.max(sideU, 0.02), Math.max(sideU, 0.02), 1);
+      this.aperture.quaternion.copy(this.quat);
+      this.aperture.position.set(0, lamU * 0.25, 0);
+      this.aperture.material.color.copy(colour);
+    } else {
+      this.fronts.forEach(f => f.visible = false);
+    }
+
+    this.updateReadout(lamM, tx);
+  },
+
+  updateReadout: function (lamM, tx) {
+    const d = this.data;
+    const key = d.bandIndex + '|' + d.mode;
+    if (key === this.lastKey) { return; }
+    this.lastKey = key;
+
+    const band = BANDS[d.bandIndex];
+    const lamCm = lamM * 100;
+
+    this.ui.band.textContent = band.name;
+    this.ui.lambda.textContent = lamCm.toFixed(1) + ' cm';
+    this.ui.lambda.style.color = tx ? d.txColor : d.rxColor;
+    this.ui.lamSub.textContent =
+      'one wavelength, shown at actual size · antenna is ½ of that';
+
+    const aEff = (lamM * lamM * G_DIPOLE) / (4 * Math.PI);          // m^2
+    const sAt1 = (d.txPower * G_DIPOLE) / (4 * Math.PI * 1);        // W/m^2 at 1 m
+    const r = d.towerDist;
+    const sAtR = (d.txPower * G_DIPOLE) / (4 * Math.PI * r * r);
+    const pRx = sAtR * aEff;                                        // W
+    const dBm = 10 * Math.log10(pRx * 1000);
+
+    if (tx) {
+      this.ui.stats.innerHTML =
+        'transmitting ' + (d.txPower * 1000).toFixed(0) + ' mW<br>' +
+        'power density at 1 m: ' + (sAt1 * 1000).toFixed(1) + ' mW/m²<br>' +
+        'falls with the square of distance';
+    } else {
+      this.ui.stats.innerHTML =
+        'this phone captures ' + (aEff * 10000).toFixed(1) + ' cm² of the wavefront<br>' +
+        'at ' + r + ' m from a tower that is about ' + dBm.toFixed(0) + ' dBm<br>' +
+        'the rest of the wave carries straight past';
+    }
+  },
+
+  remove: function () { this.el.removeObject3D('rw'); }
+});
+
+
+/* ── tap to change band, button to flip send/receive ── */
+AFRAME.registerComponent('controls', {
+  init: function () {
+    this.band = 1;
+    this.tx = true;
+
+    const target = () => document.querySelector('#rw');
+
+    document.addEventListener('click', (e) => {
+      if (e.target && e.target.id === 'modeBtn') { return; }
+      this.band = (this.band + 1) % BANDS.length;
+      target().setAttribute('real-waves', 'bandIndex', this.band);
+    });
+
+    document.querySelector('#modeBtn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.tx = !this.tx;
+      target().setAttribute('real-waves', 'mode', this.tx ? 'tx' : 'rx');
+      e.target.textContent = this.tx ? 'SENDING' : 'RECEIVING';
+    });
+  }
+});
+</script>
+
+
+<a-scene embedded
+         arjs="sourceType: webcam; debugUIEnabled: false"
+         vr-mode-ui="enabled: false"
+         renderer="antialias: true; alpha: true"
+         controls>
+
+  <a-marker preset="hiro">
+    <!-- 8.5 cm printed marker -->
+    <a-entity id="rw" real-waves="markerSizeCm: 8.5; bandIndex: 1"></a-entity>
+  </a-marker>
+
+  <a-entity camera></a-entity>
+</a-scene>
+
+<button id="modeBtn">SENDING</button>
+<div id="warn">Scale anchored to an 8.5 cm marker. Re-measure if you reprint.</div>
+
+<div id="panel">
+  <div id="band">1.9 GHz &middot; LTE / PCS</div>
+  <div id="lambda">15.8 cm</div>
+  <div id="lamSub">one wavelength, shown at actual size</div>
+  <div id="stats"></div>
+  <div id="tap">Tap anywhere to change frequency band</div>
+</div>
+
+</body>
+</html>
